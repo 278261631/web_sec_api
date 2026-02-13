@@ -1,10 +1,12 @@
 """
 图像监控客户端 - PySide6 GUI
 定时轮询服务端，检查图像是否有更新，若有则拉取并展示
+所有连接配置从 client_config.yaml 读取
 """
 
 import os
 import sys
+from datetime import datetime, timezone
 
 import yaml
 import requests
@@ -17,9 +19,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
-    QPushButton,
-    QSpinBox,
     QStatusBar,
     QGroupBox,
     QScrollArea,
@@ -35,11 +34,6 @@ def load_config() -> dict:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     return {}
-
-
-def save_config(cfg: dict):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(cfg, f, allow_unicode=True)
 
 
 # ───────── 后台轮询线程 ─────────
@@ -115,14 +109,22 @@ class MainWindow(QMainWindow):
         self._server_url = cfg.get("server_url", "http://127.0.0.1:8120")
         self._api_key = cfg.get("api_key", "key-abc123456")
         self._poll_interval = cfg.get("poll_interval", 5)
-        self._polling = False
         self._poller: PollerThread | None = None
+        self._last_modified_iso: str | None = None
 
         self._build_ui()
 
-        # 定时器
+        # 轮询定时器
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._do_poll)
+
+        # 时间差刷新定时器（每秒更新一次距今时间）
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
+        self._elapsed_timer.start(1000)
+
+        # 启动后自动开始监控
+        QTimer.singleShot(300, self._start_polling)
 
     # ── UI 构建 ──
     def _build_ui(self):
@@ -131,42 +133,6 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(10)
-
-        # --- 配置区 ---
-        config_group = QGroupBox("连接设置")
-        config_layout = QVBoxLayout(config_group)
-
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("服务器地址:"))
-        self._edit_url = QLineEdit(self._server_url)
-        self._edit_url.setMinimumWidth(300)
-        row1.addWidget(self._edit_url)
-        row1.addWidget(QLabel("API Key:"))
-        self._edit_key = QLineEdit(self._api_key)
-        self._edit_key.setMinimumWidth(200)
-        row1.addWidget(self._edit_key)
-        config_layout.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("轮询间隔 (秒):"))
-        self._spin_interval = QSpinBox()
-        self._spin_interval.setRange(1, 3600)
-        self._spin_interval.setValue(self._poll_interval)
-        row2.addWidget(self._spin_interval)
-        row2.addStretch()
-
-        self._btn_start = QPushButton("▶ 开始监控")
-        self._btn_start.setFixedWidth(140)
-        self._btn_start.clicked.connect(self._toggle_polling)
-        row2.addWidget(self._btn_start)
-
-        self._btn_once = QPushButton("手动刷新")
-        self._btn_once.setFixedWidth(100)
-        self._btn_once.clicked.connect(self._do_poll)
-        row2.addWidget(self._btn_once)
-
-        config_layout.addLayout(row2)
-        main_layout.addWidget(config_group)
 
         # --- 状态信息区 ---
         info_group = QGroupBox("图像状态")
@@ -198,54 +164,19 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage("就绪")
 
     # ── 控制 ──
-    def _toggle_polling(self):
-        if self._polling:
-            self._stop_polling()
-        else:
-            self._start_polling()
-
     def _start_polling(self):
-        self._server_url = self._edit_url.text().strip()
-        self._api_key = self._edit_key.text().strip()
-        self._poll_interval = self._spin_interval.value()
-
         if not self._server_url or not self._api_key:
-            self._status_bar.showMessage("请填写服务器地址和 API Key")
+            self._status_bar.showMessage("配置文件缺少 server_url 或 api_key")
             return
-
-        # 保存配置
-        save_config({
-            "server_url": self._server_url,
-            "api_key": self._api_key,
-            "poll_interval": self._poll_interval,
-        })
-
-        self._polling = True
-        self._btn_start.setText("■ 停止监控")
-        self._edit_url.setEnabled(False)
-        self._edit_key.setEnabled(False)
-        self._spin_interval.setEnabled(False)
 
         self._timer.start(self._poll_interval * 1000)
         self._status_bar.showMessage(f"监控中 — 每 {self._poll_interval} 秒轮询一次")
         self._do_poll()  # 立即执行一次
 
-    def _stop_polling(self):
-        self._polling = False
-        self._timer.stop()
-        self._btn_start.setText("▶ 开始监控")
-        self._edit_url.setEnabled(True)
-        self._edit_key.setEnabled(True)
-        self._spin_interval.setEnabled(True)
-        self._status_bar.showMessage("已停止监控")
-
     def _do_poll(self):
         """启动一次后台轮询"""
         if self._poller and self._poller.isRunning():
             return  # 上一次还没完成
-
-        self._server_url = self._edit_url.text().strip()
-        self._api_key = self._edit_key.text().strip()
 
         self._poller = PollerThread(self._server_url, self._api_key)
         self._poller.status_ready.connect(self._on_status)
@@ -253,14 +184,43 @@ class MainWindow(QMainWindow):
         self._poller.error_occurred.connect(self._on_error)
         self._poller.start()
 
+    # ── 时间差计算 ──
+    @staticmethod
+    def _format_elapsed(iso_str: str) -> str:
+        """将 ISO 时间字符串与当前时间比较，返回 'X天X小时X分X秒' 格式"""
+        try:
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            delta = now - dt
+            total_seconds = int(delta.total_seconds())
+            if total_seconds < 0:
+                return "刚刚"
+            days, remainder = divmod(total_seconds, 86400)
+            hours, remainder = divmod(remainder, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            return f"{days}天{hours}小时{minutes}分{seconds}秒"
+        except Exception:
+            return "--"
+
+    def _update_elapsed(self):
+        """每秒刷新一次距今时间"""
+        if self._last_modified_iso:
+            elapsed = self._format_elapsed(self._last_modified_iso)
+            self._lbl_modified.setText(f"最后更新时间: {self._last_modified_iso}  （{elapsed}前）")
+
     # ── 信号槽 ──
     def _on_status(self, info: dict):
         if not info.get("exists"):
+            self._last_modified_iso = None
             self._lbl_modified.setText("最后更新时间: 文件不存在")
             self._lbl_md5.setText("MD5: --")
             self._lbl_size.setText("大小: --")
             return
-        self._lbl_modified.setText(f"最后更新时间: {info.get('last_modified', '--')}")
+        self._last_modified_iso = info.get("last_modified", "")
+        elapsed = self._format_elapsed(self._last_modified_iso) if self._last_modified_iso else "--"
+        self._lbl_modified.setText(f"最后更新时间: {self._last_modified_iso}  （{elapsed}前）")
         self._lbl_md5.setText(f"MD5: {info.get('md5', '--')}")
         size_bytes = info.get("size", 0)
         if size_bytes >= 1024 * 1024:

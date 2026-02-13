@@ -7,6 +7,9 @@ image_path: "D:/github/test_img/test.png"
 host: "0.0.0.0"
 port: 8120
 
+# 后台检测图像变化的间隔（秒）
+check_interval: 5.0
+
 # 允许的 API Key 列表
 api_keys:
   - "key-abc123456"
