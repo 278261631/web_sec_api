@@ -60,7 +60,7 @@ class PollerThread(QThread):
 
             # 1. 查询状态
             resp = requests.get(
-                f"{self.server_url}/api/image/status",
+                f"{self.server_url}/allsky/api/image/status",
                 headers=headers,
                 timeout=10,
             )
@@ -81,7 +81,7 @@ class PollerThread(QThread):
                 return  # 图像未变化
 
             resp_img = requests.get(
-                f"{self.server_url}/api/image/data",
+                f"{self.server_url}/allsky/api/image/data",
                 headers=headers,
                 timeout=30,
             )

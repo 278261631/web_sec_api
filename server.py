@@ -124,12 +124,12 @@ tracker = ImageTracker(IMAGE_PATH, CHECK_INTERVAL)
 
 # ───────── 路由 ─────────
 
-@app.get("/")
+@app.get("/allsky/")
 def root():
     return {"message": "图像监控 API 正在运行"}
 
 
-@app.get("/api/image/status")
+@app.get("/allsky/api/image/status")
 def image_status(x_api_key: str | None = Header(None)):
     """
     检查图像是否存在、最后更换时间和 MD5
@@ -140,7 +140,7 @@ def image_status(x_api_key: str | None = Header(None)):
     return JSONResponse(content=info)
 
 
-@app.get("/api/image/data")
+@app.get("/allsky/api/image/data")
 def image_data(x_api_key: str | None = Header(None)):
     """
     返回图像二进制数据
