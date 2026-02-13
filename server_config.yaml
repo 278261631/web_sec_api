@@ -10,6 +10,9 @@ port: 28010
 # 后台检测图像变化的间隔（秒）
 check_interval: 5.0
 
+# 客户端活跃超时（秒），超过此时间未活动视为离线，其他客户端可接管该 Key
+session_timeout: 30.0
+
 # 允许的 API Key 列表
 api_keys:
   - "key-abc123456"

@@ -6,6 +6,7 @@
 
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 
 import yaml
@@ -44,10 +45,11 @@ class PollerThread(QThread):
     image_ready = Signal(bytes)       # 发送图像字节
     error_occurred = Signal(str)      # 发送错误信息
 
-    def __init__(self, server_url: str, api_key: str):
+    def __init__(self, server_url: str, api_key: str, client_id: str):
         super().__init__()
         self.server_url = server_url.rstrip("/")
         self.api_key = api_key
+        self.client_id = client_id
         self._last_md5: str | None = None
         self._running = True
 
@@ -56,7 +58,10 @@ class PollerThread(QThread):
         if not self._running:
             return
         try:
-            headers = {"X-Api-Key": self.api_key}
+            headers = {
+                "X-Api-Key": self.api_key,
+                "X-Client-Id": self.client_id,
+            }
 
             # 1. 查询状态
             resp = requests.get(
@@ -66,6 +71,10 @@ class PollerThread(QThread):
             )
             if resp.status_code == 403:
                 self.error_occurred.emit("API Key 无效，服务器拒绝访问")
+                return
+            if resp.status_code == 409:
+                detail = resp.json().get("detail", "该 Key 已被其他客户端占用")
+                self.error_occurred.emit(detail)
                 return
             resp.raise_for_status()
             info: dict = resp.json()
@@ -111,6 +120,8 @@ class MainWindow(QMainWindow):
         self._poll_interval = cfg.get("poll_interval", 5)
         self._poller: PollerThread | None = None
         self._last_modified_iso: str | None = None
+        # 每次启动生成唯一客户端 ID，同一 Key 下只允许一个 client_id 活跃
+        self._client_id = str(uuid.uuid4())
 
         self._build_ui()
 
@@ -178,7 +189,7 @@ class MainWindow(QMainWindow):
         if self._poller and self._poller.isRunning():
             return  # 上一次还没完成
 
-        self._poller = PollerThread(self._server_url, self._api_key)
+        self._poller = PollerThread(self._server_url, self._api_key, self._client_id)
         self._poller.status_ready.connect(self._on_status)
         self._poller.image_ready.connect(self._on_image)
         self._poller.error_occurred.connect(self._on_error)

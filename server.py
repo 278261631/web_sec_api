@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 import yaml
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 # ───────── 加载配置 ─────────
@@ -33,15 +33,57 @@ PORT: int = config.get("port", 8120)
 API_KEYS: list[str] = config.get("api_keys", [])
 # 后台检测间隔（秒）
 CHECK_INTERVAL: float = config.get("check_interval", 2.0)
+# 客户端活跃超时时间（秒），超过此时间未活动视为离线，其他客户端可接管该 Key
+SESSION_TIMEOUT: float = config.get("session_timeout", 30.0)
 
 # ───────── FastAPI 应用 ─────────
 app = FastAPI(title="图像监控 API", version="1.0.0")
 
 
-def verify_api_key(x_api_key: str | None):
-    """校验请求头中的 API Key"""
+# ───────── 会话管理：每个 Key 只允许一个活跃客户端 ─────────
+# key -> {"client_id": 客户端唯一ID, "ip": 来源IP, "last_active": 最后活动时间戳}
+_active_sessions: dict[str, dict] = {}
+_session_lock = threading.Lock()
+
+
+def verify_api_key(
+    x_api_key: str | None,
+    client_id: str = "",
+    client_ip: str = "",
+):
+    """校验 API Key 并通过 client_id 检查是否有其他客户端正在使用该 Key"""
     if not x_api_key or x_api_key not in API_KEYS:
         raise HTTPException(status_code=403, detail="无效的 API Key 或未提供 API Key")
+
+    if not client_id:
+        raise HTTPException(status_code=400, detail="缺少 X-Client-Id 请求头")
+
+    now = time.time()
+    with _session_lock:
+        session = _active_sessions.get(x_api_key)
+        if session is not None:
+            elapsed = now - session["last_active"]
+            # 同一个 client_id 视为同一客户端，直接刷新活跃时间
+            if session["client_id"] == client_id:
+                session["last_active"] = now
+                return
+            # 不同 client_id 但上一个客户端已超时，允许新客户端接管
+            if elapsed > SESSION_TIMEOUT:
+                _active_sessions[x_api_key] = {
+                    "client_id": client_id, "ip": client_ip, "last_active": now,
+                }
+                return
+            # 不同 client_id 且上一个客户端仍活跃，拒绝
+            raise HTTPException(
+                status_code=409,
+                detail=f"该 API Key 已被另一个客户端占用"
+                       f"（ID: {session['client_id'][:8]}…, IP: {session['ip']}），"
+                       f"请等待 {int(SESSION_TIMEOUT - elapsed)} 秒后重试或使用其他 Key",
+            )
+        # 首次使用该 Key
+        _active_sessions[x_api_key] = {
+            "client_id": client_id, "ip": client_ip, "last_active": now,
+        }
 
 
 def _file_md5(path: str) -> str:
@@ -130,22 +172,38 @@ def root():
 
 
 @app.get("/allsky/api/image/status")
-def image_status(x_api_key: str | None = Header(None)):
+def image_status(
+    request: Request,
+    x_api_key: str | None = Header(None),
+    x_client_id: str | None = Header(None),
+):
     """
     检查图像是否存在、最后更换时间和 MD5
     last_modified 为服务端检测到图像内容变化的真实时间，非文件系统时间
     """
-    verify_api_key(x_api_key)
+    verify_api_key(
+        x_api_key,
+        client_id=x_client_id or "",
+        client_ip=request.client.host if request.client else "",
+    )
     info = tracker.get_info()
     return JSONResponse(content=info)
 
 
 @app.get("/allsky/api/image/data")
-def image_data(x_api_key: str | None = Header(None)):
+def image_data(
+    request: Request,
+    x_api_key: str | None = Header(None),
+    x_client_id: str | None = Header(None),
+):
     """
     返回图像二进制数据
     """
-    verify_api_key(x_api_key)
+    verify_api_key(
+        x_api_key,
+        client_id=x_client_id or "",
+        client_ip=request.client.host if request.client else "",
+    )
 
     if not os.path.isfile(IMAGE_PATH):
         raise HTTPException(status_code=404, detail="图像文件不存在")
