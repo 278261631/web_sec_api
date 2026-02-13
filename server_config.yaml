@@ -5,7 +5,7 @@ image_path: "D:/github/test_img/test.png"
 
 # 服务器监听设置
 host: "0.0.0.0"
-port: 8120
+port: 28010
 
 # 后台检测图像变化的间隔（秒）
 check_interval: 5.0
