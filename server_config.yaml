@@ -4,16 +4,22 @@
 images:
   - name: "test"
     path: "D:/github/test_img/test.png"
+    level: "main"
   - name: "AAG_ImageCloudCondition"
     path: "D:/github/test_img/AAG_ImageCloudCondition.png"
+    level: "sub"
   - name: "AAG_ImageDayCondition"
     path: "D:/github/test_img/AAG_ImageDayCondition.png"
+    level: "sub"
   - name: "test-c"
     path: "D:/github/test_img/test-c.jpg"
+    level: "main"
   - name: "test-d"
     path: "D:/github/test_img/test-d.jpg"
+    level: "sub"
   - name: "test-e"
     path: "D:/github/test_img/test-e.png"
+    level: "sub"
 
 # 服务器监听设置
 host: "0.0.0.0"

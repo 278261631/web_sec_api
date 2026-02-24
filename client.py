@@ -380,6 +380,7 @@ class MainWindow(QMainWindow):
         self._last_md5_map: dict[str, str] = {}
         self._image_cards: dict[str, ImageCard] = {}
         self._image_order: list[str] = []
+        self._image_levels: list[str] = []
 
         self._build_ui()
 
@@ -404,16 +405,8 @@ class MainWindow(QMainWindow):
         self._main_layout.setContentsMargins(12, 12, 12, 12)
         self._main_layout.setSpacing(12)
 
-        self._primary_card: ImageCard | None = None
-
-        self._grid_widget = QWidget()
-        self._grid_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self._grid_layout = QGridLayout(self._grid_widget)
-        self._grid_layout.setContentsMargins(0, 0, 0, 0)
-        self._grid_layout.setSpacing(10)
-        for col in range(GRID_COLUMNS):
-            self._grid_layout.setColumnStretch(col, 1)
-        self._main_layout.addWidget(self._grid_widget)
+        # _dynamic_widgets 保存所有动态添加的 widget（ImageCard 或 grid 容器）
+        self._dynamic_widgets: list[QWidget] = []
 
         self._main_layout.addStretch()
 
@@ -425,43 +418,70 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("就绪")
 
-    def _rebuild_layout(self, names: list[str]):
-        if not names:
-            return
-
-        primary_name = names[0]
-        if self._primary_card is None or self._primary_card.image_name != primary_name:
-            if self._primary_card is not None:
-                self._main_layout.removeWidget(self._primary_card)
-                self._primary_card.setParent(None)
-                old_name = self._primary_card.image_name
-                if old_name in self._image_cards:
-                    del self._image_cards[old_name]
-                self._primary_card.deleteLater()
-                self._primary_card = None
-
-            card = ImageCard(primary_name, is_primary=True)
-            self._image_cards[primary_name] = card
-            self._primary_card = card
-            self._main_layout.insertWidget(0, card, stretch=2)
-
-        while self._grid_layout.count():
-            item = self._grid_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                name = getattr(w, "image_name", None)
-                if name and name in self._image_cards and name != primary_name:
-                    del self._image_cards[name]
-                w.setParent(None)
-                w.deleteLater()
-
-        rest = names[1:]
-        for idx, name in enumerate(rest):
+    def _make_sub_grid(self, sub_names: list[str]) -> QWidget:
+        """将一组 sub 图像名打包成一个 grid 容器 widget"""
+        grid_widget = QWidget()
+        grid_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        grid_layout = QGridLayout(grid_widget)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setSpacing(10)
+        for col in range(GRID_COLUMNS):
+            grid_layout.setColumnStretch(col, 1)
+        for idx, name in enumerate(sub_names):
             row = idx // GRID_COLUMNS
             col = idx % GRID_COLUMNS
             card = ImageCard(name, is_primary=False)
             self._image_cards[name] = card
-            self._grid_layout.addWidget(card, row, col)
+            grid_layout.addWidget(card, row, col)
+        return grid_widget
+
+    def _rebuild_layout(self, images_info: list[dict]):
+        """按原始顺序重建布局：main 独占一行，连续 sub 打包为 grid（每行3个）"""
+        if not images_info:
+            return
+
+        # ── 清理旧的动态 widget ──
+        for w in self._dynamic_widgets:
+            self._main_layout.removeWidget(w)
+            w.setParent(None)
+            w.deleteLater()
+        self._dynamic_widgets.clear()
+        self._image_cards.clear()
+
+        # ── 按顺序遍历，积攒连续 sub 后统一 flush ──
+        pending_sub: list[str] = []
+        insert_pos = 0  # 插入位置（在尾部 stretch 之前）
+
+        def _flush_subs():
+            nonlocal insert_pos
+            if not pending_sub:
+                return
+            grid = self._make_sub_grid(list(pending_sub))
+            self._dynamic_widgets.append(grid)
+            self._main_layout.insertWidget(insert_pos, grid)
+            insert_pos += 1
+            pending_sub.clear()
+
+        for info in images_info:
+            name = info.get("name", "")
+            level = info.get("level", "sub")
+            if not name:
+                continue
+
+            if level == "main":
+                # 先 flush 积攒的 sub
+                _flush_subs()
+                # 添加 main 卡片
+                card = ImageCard(name, is_primary=True)
+                self._image_cards[name] = card
+                self._dynamic_widgets.append(card)
+                self._main_layout.insertWidget(insert_pos, card, stretch=2)
+                insert_pos += 1
+            else:
+                pending_sub.append(name)
+
+        # 尾部剩余 sub
+        _flush_subs()
 
     # ── 控制 ──
     def _start_polling(self):
@@ -492,11 +512,14 @@ class MainWindow(QMainWindow):
 
     # ── 信号槽 ──
     def _on_status(self, images_info: list):
-        new_names = [info.get("name", "") for info in images_info if info.get("name")]
+        # 用 (name, level) 组合判断是否需要重建布局
+        new_key = [(info.get("name", ""), info.get("level", "sub")) for info in images_info if info.get("name")]
+        old_key = [(n, l) for n, l in zip(self._image_order, self._image_levels)]
 
-        if new_names != self._image_order:
-            self._image_order = new_names
-            self._rebuild_layout(new_names)
+        if new_key != old_key:
+            self._image_order = [k[0] for k in new_key]
+            self._image_levels = [k[1] for k in new_key]
+            self._rebuild_layout(images_info)
 
         for info in images_info:
             name = info.get("name", "")

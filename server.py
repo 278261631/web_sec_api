@@ -99,9 +99,10 @@ class ImageTracker:
     当内容发生变化时记录当前时刻为 '最后更换时间'。
     """
 
-    def __init__(self, name: str, image_path: str, interval: float = 5.0):
+    def __init__(self, name: str, image_path: str, level: str = "sub", interval: float = 5.0):
         self.name = name
         self._path = image_path
+        self.level = level
         self._interval = interval
         self._lock = threading.Lock()
 
@@ -142,9 +143,10 @@ class ImageTracker:
     def get_info(self) -> dict:
         with self._lock:
             if not self._exists:
-                return {"name": self.name, "exists": False}
+                return {"name": self.name, "level": self.level, "exists": False}
             return {
                 "name": self.name,
+                "level": self.level,
                 "exists": True,
                 "last_modified": self._last_changed,
                 "size": self._size,
@@ -162,8 +164,9 @@ trackers: dict[str, ImageTracker] = {}
 for img_cfg in IMAGES_CFG:
     name = img_cfg.get("name", "")
     path = img_cfg.get("path", "")
+    level = img_cfg.get("level", "sub")
     if name and path:
-        trackers[name] = ImageTracker(name, path, CHECK_INTERVAL)
+        trackers[name] = ImageTracker(name, path, level=level, interval=CHECK_INTERVAL)
 
 
 def _get_tracker(name: str) -> ImageTracker:
