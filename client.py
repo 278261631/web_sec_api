@@ -2,6 +2,7 @@
 图像监控客户端 - PySide6 GUI
 定时轮询服务端，检查所有图像是否有更新，同时展示全部图像
 第一个图像为主图占整行，其余图像每行3个
+点击图像可弹出大图预览
 所有连接配置从 client_config.yaml 读取
 """
 
@@ -13,7 +14,7 @@ from datetime import datetime, timezone
 import yaml
 import requests
 from PySide6.QtCore import Qt, QTimer, Signal, QThread
-from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtGui import QPixmap, QImage, QCursor
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QFrame,
+    QDialog,
 )
 
 # ───────── 加载配置 ─────────
@@ -40,15 +42,78 @@ def load_config() -> dict:
     return {}
 
 
+# ───────── 可点击的图像标签 ─────────
+class ClickableLabel(QLabel):
+    """点击可触发信号的 QLabel"""
+    clicked = Signal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+# ───────── 大图预览对话框 ─────────
+class ImagePreviewDialog(QDialog):
+    """弹出窗口，显示图像大图，点击或按 Esc 关闭"""
+
+    def __init__(self, title: str, pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"大图预览 — {title}")
+        self.setMinimumSize(600, 400)
+
+        # 获取屏幕尺寸，对话框最大为屏幕 90%
+        screen = QApplication.primaryScreen().availableGeometry()
+        max_w = int(screen.width() * 0.9)
+        max_h = int(screen.height() * 0.9)
+
+        # 按比例缩放图像以适应屏幕
+        scaled = pixmap.scaled(
+            max_w, max_h,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setAlignment(Qt.AlignCenter)
+
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setPixmap(scaled)
+        lbl.setStyleSheet("background-color: #1a1a1a;")
+        scroll.setWidget(lbl)
+
+        layout.addWidget(scroll)
+
+        # 调整对话框大小以适应图片
+        dialog_w = min(scaled.width() + 40, max_w)
+        dialog_h = min(scaled.height() + 40, max_h)
+        self.resize(dialog_w, dialog_h)
+
+    def mousePressEvent(self, event):
+        """点击任意位置关闭"""
+        self.close()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        super().keyPressEvent(event)
+
+
 # ───────── 单个图像卡片 Widget ─────────
 class ImageCard(QGroupBox):
-    """一个图像的展示卡片：标题 + 状态 + 图像"""
+    """一个图像的展示卡片：标题 + 状态 + 图像（可点击预览大图）"""
 
     def __init__(self, name: str, is_primary: bool = False, parent=None):
         super().__init__(name, parent)
         self.image_name = name
         self._is_primary = is_primary
         self._last_modified_iso: str | None = None
+        self._full_pixmap: QPixmap | None = None  # 保存原始分辨率图像
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._build_ui()
 
@@ -67,14 +132,16 @@ class ImageCard(QGroupBox):
         info_row.addStretch()
         layout.addLayout(info_row)
 
-        # 图像
-        self._lbl_image = QLabel("暂无图像")
+        # 可点击图像
+        self._lbl_image = ClickableLabel("暂无图像")
         self._lbl_image.setAlignment(Qt.AlignCenter)
         min_h = 400 if self._is_primary else 180
         self._lbl_image.setMinimumHeight(min_h)
         self._lbl_image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self._lbl_image.setStyleSheet("background-color: #2b2b2b; color: #aaa; font-size: 14px;")
         self._lbl_image.setFrameShape(QFrame.StyledPanel)
+        self._lbl_image.setCursor(QCursor(Qt.PointingHandCursor))
+        self._lbl_image.clicked.connect(self._show_preview)
         layout.addWidget(self._lbl_image, stretch=1)
 
     def update_status(self, info: dict):
@@ -101,14 +168,21 @@ class ImageCard(QGroupBox):
         img.loadFromData(data)
         if img.isNull():
             self._lbl_image.setText("图像解码失败")
+            self._full_pixmap = None
             return
-        pixmap = QPixmap.fromImage(img)
-        scaled = pixmap.scaled(
+        self._full_pixmap = QPixmap.fromImage(img)
+        scaled = self._full_pixmap.scaled(
             self._lbl_image.size(),
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
         self._lbl_image.setPixmap(scaled)
+
+    def _show_preview(self):
+        """点击图像时弹出大图预览"""
+        if self._full_pixmap and not self._full_pixmap.isNull():
+            dlg = ImagePreviewDialog(self.image_name, self._full_pixmap, self)
+            dlg.exec()
 
     def refresh_elapsed(self):
         self._refresh_elapsed()
@@ -227,7 +301,7 @@ class MainWindow(QMainWindow):
 
         self._last_md5_map: dict[str, str] = {}
         self._image_cards: dict[str, ImageCard] = {}
-        self._image_order: list[str] = []  # 保持服务端返回的顺序
+        self._image_order: list[str] = []
 
         self._build_ui()
 
@@ -252,10 +326,8 @@ class MainWindow(QMainWindow):
         self._main_layout.setContentsMargins(12, 12, 12, 12)
         self._main_layout.setSpacing(12)
 
-        # 主图区域（第一个图像）
         self._primary_card: ImageCard | None = None
 
-        # 网格区域（其余图像，每行3个）
         self._grid_widget = QWidget()
         self._grid_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._grid_layout = QGridLayout(self._grid_widget)
@@ -269,25 +341,21 @@ class MainWindow(QMainWindow):
 
         scroll.setWidget(self._container)
         self.setCentralWidget(scroll)
-        self._scroll = scroll  # 保存引用，用于 resizeEvent
+        self._scroll = scroll
 
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("就绪")
 
     def _rebuild_layout(self, names: list[str]):
-        """根据图像名列表重建布局：第一个为主图，其余每行3个"""
         if not names:
             return
 
-        # 主图
         primary_name = names[0]
         if self._primary_card is None or self._primary_card.image_name != primary_name:
-            # 移除旧主图
             if self._primary_card is not None:
                 self._main_layout.removeWidget(self._primary_card)
                 self._primary_card.setParent(None)
-                # 如果旧主图 name 还在列表中，后面会作为小图重建
                 old_name = self._primary_card.image_name
                 if old_name in self._image_cards:
                     del self._image_cards[old_name]
@@ -297,10 +365,8 @@ class MainWindow(QMainWindow):
             card = ImageCard(primary_name, is_primary=True)
             self._image_cards[primary_name] = card
             self._primary_card = card
-            # 插入到 grid_widget 之前（位置 0）
             self._main_layout.insertWidget(0, card, stretch=2)
 
-        # 清空网格中的旧卡片
         while self._grid_layout.count():
             item = self._grid_layout.takeAt(0)
             w = item.widget()
@@ -311,7 +377,6 @@ class MainWindow(QMainWindow):
                 w.setParent(None)
                 w.deleteLater()
 
-        # 其余图像按每行 GRID_COLUMNS 个填入网格
         rest = names[1:]
         for idx, name in enumerate(rest):
             row = idx // GRID_COLUMNS
@@ -351,29 +416,15 @@ class MainWindow(QMainWindow):
     def _on_status(self, images_info: list):
         new_names = [info.get("name", "") for info in images_info if info.get("name")]
 
-        # 图像列表变化时重建布局
         if new_names != self._image_order:
             self._image_order = new_names
             self._rebuild_layout(new_names)
 
-        # 更新每个卡片的状态
         for info in images_info:
             name = info.get("name", "")
             card = self._image_cards.get(name)
             if card:
                 card.update_status(info)
-
-        # ── 调试日志：输出各层容器和卡片宽度 ──
-        win_w = self.width()
-        scroll = self.centralWidget()
-        scroll_w = scroll.width() if scroll else -1
-        container_w = self._container.width()
-        grid_w = self._grid_widget.width()
-        print(f"[宽度调试] 窗口={win_w}, ScrollArea={scroll_w}, "
-              f"Container={container_w}, GridWidget={grid_w}")
-        for name, card in self._image_cards.items():
-            parent_w = card.parentWidget().width() if card.parentWidget() else -1
-            print(f"  [{name}] card_w={card.width()}, parent_w={parent_w}")
 
     def _on_image(self, name: str, data: bytes):
         card = self._image_cards.get(name)
@@ -385,12 +436,10 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"⚠ {msg}")
 
     def showEvent(self, event):
-        """窗口首次显示时，同步容器宽度"""
         super().showEvent(event)
         self._sync_container_width()
 
     def resizeEvent(self, event):
-        """窗口大小变化时，限制容器宽度与视口一致，防止图像撑宽"""
         super().resizeEvent(event)
         self._sync_container_width()
 
