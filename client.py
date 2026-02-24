@@ -49,6 +49,7 @@ class ImageCard(QGroupBox):
         self.image_name = name
         self._is_primary = is_primary
         self._last_modified_iso: str | None = None
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._build_ui()
 
     def _build_ui(self):
@@ -71,7 +72,7 @@ class ImageCard(QGroupBox):
         self._lbl_image.setAlignment(Qt.AlignCenter)
         min_h = 400 if self._is_primary else 180
         self._lbl_image.setMinimumHeight(min_h)
-        self._lbl_image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._lbl_image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self._lbl_image.setStyleSheet("background-color: #2b2b2b; color: #aaa; font-size: 14px;")
         self._lbl_image.setFrameShape(QFrame.StyledPanel)
         layout.addWidget(self._lbl_image, stretch=1)
@@ -243,8 +244,10 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         self._container = QWidget()
+        self._container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._main_layout = QVBoxLayout(self._container)
         self._main_layout.setContentsMargins(12, 12, 12, 12)
         self._main_layout.setSpacing(12)
@@ -254,9 +257,10 @@ class MainWindow(QMainWindow):
 
         # 网格区域（其余图像，每行3个）
         self._grid_widget = QWidget()
+        self._grid_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._grid_layout = QGridLayout(self._grid_widget)
+        self._grid_layout.setContentsMargins(0, 0, 0, 0)
         self._grid_layout.setSpacing(10)
-        # 每列等比例拉伸，撑满窗口宽度
         for col in range(GRID_COLUMNS):
             self._grid_layout.setColumnStretch(col, 1)
         self._main_layout.addWidget(self._grid_widget)
@@ -265,6 +269,7 @@ class MainWindow(QMainWindow):
 
         scroll.setWidget(self._container)
         self.setCentralWidget(scroll)
+        self._scroll = scroll  # 保存引用，用于 resizeEvent
 
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
@@ -358,6 +363,18 @@ class MainWindow(QMainWindow):
             if card:
                 card.update_status(info)
 
+        # ── 调试日志：输出各层容器和卡片宽度 ──
+        win_w = self.width()
+        scroll = self.centralWidget()
+        scroll_w = scroll.width() if scroll else -1
+        container_w = self._container.width()
+        grid_w = self._grid_widget.width()
+        print(f"[宽度调试] 窗口={win_w}, ScrollArea={scroll_w}, "
+              f"Container={container_w}, GridWidget={grid_w}")
+        for name, card in self._image_cards.items():
+            parent_w = card.parentWidget().width() if card.parentWidget() else -1
+            print(f"  [{name}] card_w={card.width()}, parent_w={parent_w}")
+
     def _on_image(self, name: str, data: bytes):
         card = self._image_cards.get(name)
         if card:
@@ -366,6 +383,20 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, msg: str):
         self._status_bar.showMessage(f"⚠ {msg}")
+
+    def showEvent(self, event):
+        """窗口首次显示时，同步容器宽度"""
+        super().showEvent(event)
+        self._sync_container_width()
+
+    def resizeEvent(self, event):
+        """窗口大小变化时，限制容器宽度与视口一致，防止图像撑宽"""
+        super().resizeEvent(event)
+        self._sync_container_width()
+
+    def _sync_container_width(self):
+        viewport_w = self._scroll.viewport().width()
+        self._container.setMaximumWidth(viewport_w)
 
     def closeEvent(self, event):
         if self._poller:
