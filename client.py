@@ -55,48 +55,126 @@ class ClickableLabel(QLabel):
 
 # ───────── 大图预览对话框 ─────────
 class ImagePreviewDialog(QDialog):
-    """弹出窗口，显示图像大图，点击或按 Esc 关闭"""
+    """
+    弹出窗口，默认 1:1 显示图像
+    滚轮缩放（不滚动），左键拖拽平移，点击图像关闭
+    """
+
+    ZOOM_FACTOR = 1.15
+    ZOOM_MIN = 0.1
+    ZOOM_MAX = 10.0
 
     def __init__(self, title: str, pixmap: QPixmap, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"大图预览 — {title}")
         self.setMinimumSize(600, 400)
 
-        # 获取屏幕尺寸，对话框最大为屏幕 90%
-        screen = QApplication.primaryScreen().availableGeometry()
-        max_w = int(screen.width() * 0.9)
-        max_h = int(screen.height() * 0.9)
+        self._original_pixmap = pixmap
+        self._zoom = 1.0
 
-        # 按比例缩放图像以适应屏幕
-        scaled = pixmap.scaled(
-            max_w, max_h,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
+        # 拖拽状态
+        self._dragging = False
+        self._drag_start = None   # 鼠标起始位置
+        self._scroll_start_h = 0  # 拖拽开始时滚动条位置
+        self._scroll_start_v = 0
+        self._drag_moved = False  # 是否真正拖拽移动过（区分点击和拖拽）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setAlignment(Qt.AlignCenter)
+        # 缩放提示
+        self._lbl_zoom = QLabel("100%")
+        self._lbl_zoom.setAlignment(Qt.AlignCenter)
+        self._lbl_zoom.setStyleSheet(
+            "background-color: rgba(0,0,0,180); color: #fff; "
+            "font-size: 13px; padding: 4px 12px;"
+        )
+        self._lbl_zoom.setFixedHeight(28)
+        layout.addWidget(self._lbl_zoom)
 
-        lbl = QLabel()
-        lbl.setAlignment(Qt.AlignCenter)
-        lbl.setPixmap(scaled)
-        lbl.setStyleSheet("background-color: #1a1a1a;")
-        scroll.setWidget(lbl)
+        # 滚动区域（隐藏滚动条，只用拖拽平移）
+        self._scroll = QScrollArea()
+        self._scroll.setAlignment(Qt.AlignCenter)
+        self._scroll.setStyleSheet("background-color: #1a1a1a;")
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        layout.addWidget(scroll)
+        self._lbl_image = QLabel()
+        self._lbl_image.setAlignment(Qt.AlignCenter)
+        self._lbl_image.setStyleSheet("background-color: #1a1a1a;")
+        self._lbl_image.setCursor(QCursor(Qt.OpenHandCursor))
+        self._scroll.setWidget(self._lbl_image)
 
-        # 调整对话框大小以适应图片
-        dialog_w = min(scaled.width() + 40, max_w)
-        dialog_h = min(scaled.height() + 40, max_h)
+        layout.addWidget(self._scroll, stretch=1)
+
+        # 默认 1:1 显示
+        self._apply_zoom()
+
+        # 对话框大小
+        screen = QApplication.primaryScreen().availableGeometry()
+        max_w = int(screen.width() * 0.9)
+        max_h = int(screen.height() * 0.9)
+        dialog_w = min(pixmap.width() + 40, max_w)
+        dialog_h = min(pixmap.height() + 70, max_h)
         self.resize(dialog_w, dialog_h)
 
+    def _apply_zoom(self):
+        w = int(self._original_pixmap.width() * self._zoom)
+        h = int(self._original_pixmap.height() * self._zoom)
+        scaled = self._original_pixmap.scaled(
+            w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )
+        self._lbl_image.setPixmap(scaled)
+        self._lbl_image.resize(scaled.size())
+        self._lbl_zoom.setText(f"{int(self._zoom * 100)}%")
+
+    def wheelEvent(self, event):
+        """滚轮只缩放，不滚动"""
+        event.accept()  # 吃掉事件，不传给 ScrollArea
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self._zoom = min(self._zoom * self.ZOOM_FACTOR, self.ZOOM_MAX)
+        elif delta < 0:
+            self._zoom = max(self._zoom / self.ZOOM_FACTOR, self.ZOOM_MIN)
+        self._apply_zoom()
+
     def mousePressEvent(self, event):
-        """点击任意位置关闭"""
-        self.close()
+        """左键按下：开始拖拽"""
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._drag_moved = False
+            self._drag_start = event.globalPosition().toPoint()
+            self._scroll_start_h = self._scroll.horizontalScrollBar().value()
+            self._scroll_start_v = self._scroll.verticalScrollBar().value()
+            self._lbl_image.setCursor(QCursor(Qt.ClosedHandCursor))
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """拖拽移动图像"""
+        if self._dragging and self._drag_start is not None:
+            delta = event.globalPosition().toPoint() - self._drag_start
+            if abs(delta.x()) > 3 or abs(delta.y()) > 3:
+                self._drag_moved = True
+            self._scroll.horizontalScrollBar().setValue(
+                self._scroll_start_h - delta.x()
+            )
+            self._scroll.verticalScrollBar().setValue(
+                self._scroll_start_v - delta.y()
+            )
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """左键松开：若未拖拽则视为点击关闭"""
+        if event.button() == Qt.LeftButton:
+            was_dragging = self._drag_moved
+            self._dragging = False
+            self._drag_start = None
+            self._drag_moved = False
+            self._lbl_image.setCursor(QCursor(Qt.OpenHandCursor))
+            if not was_dragging:
+                self.close()
+                return
+        super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
