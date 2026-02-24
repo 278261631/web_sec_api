@@ -1,6 +1,7 @@
 """
 图像监控客户端 - PySide6 GUI
 定时轮询服务端，检查所有图像是否有更新，同时展示全部图像
+第一个图像为主图占整行，其余图像每行3个
 所有连接配置从 client_config.yaml 读取
 """
 
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
+    QGridLayout,
     QLabel,
     QStatusBar,
     QGroupBox,
@@ -42,9 +44,10 @@ def load_config() -> dict:
 class ImageCard(QGroupBox):
     """一个图像的展示卡片：标题 + 状态 + 图像"""
 
-    def __init__(self, name: str, parent=None):
+    def __init__(self, name: str, is_primary: bool = False, parent=None):
         super().__init__(name, parent)
         self.image_name = name
+        self._is_primary = is_primary
         self._last_modified_iso: str | None = None
         self._build_ui()
 
@@ -66,7 +69,8 @@ class ImageCard(QGroupBox):
         # 图像
         self._lbl_image = QLabel("暂无图像")
         self._lbl_image.setAlignment(Qt.AlignCenter)
-        self._lbl_image.setMinimumHeight(200)
+        min_h = 400 if self._is_primary else 180
+        self._lbl_image.setMinimumHeight(min_h)
         self._lbl_image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._lbl_image.setStyleSheet("background-color: #2b2b2b; color: #aaa; font-size: 14px;")
         self._lbl_image.setFrameShape(QFrame.StyledPanel)
@@ -106,7 +110,6 @@ class ImageCard(QGroupBox):
         self._lbl_image.setPixmap(scaled)
 
     def refresh_elapsed(self):
-        """外部定时器调用，刷新时间差显示"""
         self._refresh_elapsed()
 
     def _refresh_elapsed(self):
@@ -118,7 +121,6 @@ class ImageCard(QGroupBox):
 
 
 def _format_elapsed(iso_str: str) -> str:
-    """将 ISO 时间字符串与当前时间比较，返回 'X天X小时X分X秒' 格式"""
     try:
         dt = datetime.fromisoformat(iso_str)
         if dt.tzinfo is None:
@@ -140,8 +142,8 @@ def _format_elapsed(iso_str: str) -> str:
 class PollerThread(QThread):
     """后台线程：批量查询所有图像状态，拉取所有有变化的图像"""
 
-    status_ready = Signal(list)       # 发送所有图像 status 列表
-    image_ready = Signal(str, bytes)  # (image_name, 图像字节)
+    status_ready = Signal(list)
+    image_ready = Signal(str, bytes)
     error_occurred = Signal(str)
 
     def __init__(self, server_url: str, api_key: str, client_id: str,
@@ -162,7 +164,6 @@ class PollerThread(QThread):
                 "X-Client-Id": self.client_id,
             }
 
-            # 1. 批量查询所有图像状态
             resp = requests.get(
                 f"{self.server_url}/allsky/api/images/status",
                 headers=headers,
@@ -179,7 +180,6 @@ class PollerThread(QThread):
             images_info: list = resp.json().get("images", [])
             self.status_ready.emit(images_info)
 
-            # 2. 逐个检查 MD5，有变化的全部拉取
             for info in images_info:
                 name = info.get("name", "")
                 if not name or not info.get("exists"):
@@ -187,7 +187,7 @@ class PollerThread(QThread):
                 new_md5 = info.get("md5", "")
                 old_md5 = self.last_md5_map.get(name)
                 if new_md5 and new_md5 == old_md5:
-                    continue  # 未变化
+                    continue
 
                 resp_img = requests.get(
                     f"{self.server_url}/allsky/api/image/{name}/data",
@@ -208,11 +208,14 @@ class PollerThread(QThread):
 
 
 # ───────── 主窗口 ─────────
+GRID_COLUMNS = 3  # 其余图像每行显示的列数
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("图像监控客户端")
-        self.resize(1000, 800)
+        self.resize(1100, 850)
 
         cfg = load_config()
         self._server_url = cfg.get("server_url", "http://127.0.0.1:8120")
@@ -222,53 +225,95 @@ class MainWindow(QMainWindow):
         self._client_id = str(uuid.uuid4())
 
         self._last_md5_map: dict[str, str] = {}
-        self._image_cards: dict[str, ImageCard] = {}  # name -> ImageCard
+        self._image_cards: dict[str, ImageCard] = {}
+        self._image_order: list[str] = []  # 保持服务端返回的顺序
 
         self._build_ui()
 
-        # 轮询定时器
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._do_poll)
 
-        # 时间差刷新定时器（每秒刷新所有卡片的时间差）
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.timeout.connect(self._update_all_elapsed)
         self._elapsed_timer.start(1000)
 
-        # 启动后自动开始监控
         QTimer.singleShot(300, self._start_polling)
 
     # ── UI 构建 ──
     def _build_ui(self):
-        # 用 QScrollArea 包裹，图像多时可滚动
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
 
         self._container = QWidget()
-        self._cards_layout = QVBoxLayout(self._container)
-        self._cards_layout.setContentsMargins(12, 12, 12, 12)
-        self._cards_layout.setSpacing(12)
+        self._main_layout = QVBoxLayout(self._container)
+        self._main_layout.setContentsMargins(12, 12, 12, 12)
+        self._main_layout.setSpacing(12)
 
-        # 底部弹簧，让卡片靠上排列
-        self._cards_layout.addStretch()
+        # 主图区域（第一个图像）
+        self._primary_card: ImageCard | None = None
+
+        # 网格区域（其余图像，每行3个）
+        self._grid_widget = QWidget()
+        self._grid_layout = QGridLayout(self._grid_widget)
+        self._grid_layout.setSpacing(10)
+        # 每列等比例拉伸，撑满窗口宽度
+        for col in range(GRID_COLUMNS):
+            self._grid_layout.setColumnStretch(col, 1)
+        self._main_layout.addWidget(self._grid_widget)
+
+        self._main_layout.addStretch()
 
         scroll.setWidget(self._container)
         self.setCentralWidget(scroll)
 
-        # 状态栏
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("就绪")
 
-    def _ensure_card(self, name: str) -> ImageCard:
-        """确保指定名称的卡片存在，不存在则创建"""
-        if name not in self._image_cards:
-            card = ImageCard(name)
+    def _rebuild_layout(self, names: list[str]):
+        """根据图像名列表重建布局：第一个为主图，其余每行3个"""
+        if not names:
+            return
+
+        # 主图
+        primary_name = names[0]
+        if self._primary_card is None or self._primary_card.image_name != primary_name:
+            # 移除旧主图
+            if self._primary_card is not None:
+                self._main_layout.removeWidget(self._primary_card)
+                self._primary_card.setParent(None)
+                # 如果旧主图 name 还在列表中，后面会作为小图重建
+                old_name = self._primary_card.image_name
+                if old_name in self._image_cards:
+                    del self._image_cards[old_name]
+                self._primary_card.deleteLater()
+                self._primary_card = None
+
+            card = ImageCard(primary_name, is_primary=True)
+            self._image_cards[primary_name] = card
+            self._primary_card = card
+            # 插入到 grid_widget 之前（位置 0）
+            self._main_layout.insertWidget(0, card, stretch=2)
+
+        # 清空网格中的旧卡片
+        while self._grid_layout.count():
+            item = self._grid_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                name = getattr(w, "image_name", None)
+                if name and name in self._image_cards and name != primary_name:
+                    del self._image_cards[name]
+                w.setParent(None)
+                w.deleteLater()
+
+        # 其余图像按每行 GRID_COLUMNS 个填入网格
+        rest = names[1:]
+        for idx, name in enumerate(rest):
+            row = idx // GRID_COLUMNS
+            col = idx % GRID_COLUMNS
+            card = ImageCard(name, is_primary=False)
             self._image_cards[name] = card
-            # 插入到 stretch 之前
-            idx = self._cards_layout.count() - 1  # stretch 的位置
-            self._cards_layout.insertWidget(idx, card, stretch=1)
-        return self._image_cards[name]
+            self._grid_layout.addWidget(card, row, col)
 
     # ── 控制 ──
     def _start_polling(self):
@@ -293,23 +338,30 @@ class MainWindow(QMainWindow):
         self._poller.error_occurred.connect(self._on_error)
         self._poller.start()
 
-    # ── 时间差刷新 ──
     def _update_all_elapsed(self):
         for card in self._image_cards.values():
             card.refresh_elapsed()
 
     # ── 信号槽 ──
     def _on_status(self, images_info: list):
+        new_names = [info.get("name", "") for info in images_info if info.get("name")]
+
+        # 图像列表变化时重建布局
+        if new_names != self._image_order:
+            self._image_order = new_names
+            self._rebuild_layout(new_names)
+
+        # 更新每个卡片的状态
         for info in images_info:
             name = info.get("name", "")
-            if not name:
-                continue
-            card = self._ensure_card(name)
-            card.update_status(info)
+            card = self._image_cards.get(name)
+            if card:
+                card.update_status(info)
 
     def _on_image(self, name: str, data: bytes):
-        card = self._ensure_card(name)
-        card.update_image(data)
+        card = self._image_cards.get(name)
+        if card:
+            card.update_image(data)
         self._status_bar.showMessage(f"[{name}] 图像已更新 — {len(data)} bytes")
 
     def _on_error(self, msg: str):

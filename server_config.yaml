@@ -10,7 +10,10 @@ images:
     path: "D:/github/test_img/test-b.jpg"
   - name: "test-c"
     path: "D:/github/test_img/test-c.jpg"
-
+  - name: "test-d"
+    path: "D:/github/test_img/test-d.jpg"
+  - name: "test-e"
+    path: "D:/github/test_img/test-e.png"
 
 # 服务器监听设置
 host: "0.0.0.0"
