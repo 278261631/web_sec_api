@@ -1,7 +1,16 @@
 # 服务端配置文件
 
-# 监控的图像路径
-image_path: "D:/github/test_img/test.png"
+# 监控的图像列表（支持任意数量）
+images:
+  - name: "test"
+    path: "D:/github/test_img/test.png"
+  - name: "test-a"
+    path: "D:/github/test_img/test-a.jpg"
+  - name: "test-b"
+    path: "D:/github/test_img/test-b.jpg"
+  - name: "test-c"
+    path: "D:/github/test_img/test-c.jpg"
+
 
 # 服务器监听设置
 host: "0.0.0.0"

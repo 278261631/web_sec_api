@@ -1,6 +1,6 @@
 """
 图像监控服务端 - 提供 API 供客户端检查图像更新并获取图像
-需要 API Key 鉴权
+需要 API Key 鉴权，支持多图像监控
 
 时间策略：通过比较 MD5 检测图像内容是否真正变化，
 变化时记录当前时刻作为"最后更换时间"，而非使用文件系统时间。
@@ -27,21 +27,22 @@ def load_config() -> dict:
 
 config = load_config()
 
-IMAGE_PATH: str = config.get("image_path", "D:/github/test_img/test.png")
 HOST: str = config.get("host", "0.0.0.0")
 PORT: int = config.get("port", 8120)
 API_KEYS: list[str] = config.get("api_keys", [])
-# 后台检测间隔（秒）
-CHECK_INTERVAL: float = config.get("check_interval", 2.0)
-# 客户端活跃超时时间（秒），超过此时间未活动视为离线，其他客户端可接管该 Key
+CHECK_INTERVAL: float = config.get("check_interval", 5.0)
 SESSION_TIMEOUT: float = config.get("session_timeout", 30.0)
+
+# 解析图像列表
+IMAGES_CFG: list[dict] = config.get("images", [])
+if not IMAGES_CFG:
+    print("警告: 配置文件中没有定义任何图像 (images)")
 
 # ───────── FastAPI 应用 ─────────
 app = FastAPI(title="图像监控 API", version="1.0.0")
 
 
 # ───────── 会话管理：每个 Key 只允许一个活跃客户端 ─────────
-# key -> {"client_id": 客户端唯一ID, "ip": 来源IP, "last_active": 最后活动时间戳}
 _active_sessions: dict[str, dict] = {}
 _session_lock = threading.Lock()
 
@@ -63,24 +64,20 @@ def verify_api_key(
         session = _active_sessions.get(x_api_key)
         if session is not None:
             elapsed = now - session["last_active"]
-            # 同一个 client_id 视为同一客户端，直接刷新活跃时间
             if session["client_id"] == client_id:
                 session["last_active"] = now
                 return
-            # 不同 client_id 但上一个客户端已超时，允许新客户端接管
             if elapsed > SESSION_TIMEOUT:
                 _active_sessions[x_api_key] = {
                     "client_id": client_id, "ip": client_ip, "last_active": now,
                 }
                 return
-            # 不同 client_id 且上一个客户端仍活跃，拒绝
             raise HTTPException(
                 status_code=409,
                 detail=f"该 API Key 已被另一个客户端占用"
                        f"（ID: {session['client_id'][:8]}…, IP: {session['ip']}），"
                        f"请等待 {int(SESSION_TIMEOUT - elapsed)} 秒后重试或使用其他 Key",
             )
-        # 首次使用该 Key
         _active_sessions[x_api_key] = {
             "client_id": client_id, "ip": client_ip, "last_active": now,
         }
@@ -102,7 +99,8 @@ class ImageTracker:
     当内容发生变化时记录当前时刻为 '最后更换时间'。
     """
 
-    def __init__(self, image_path: str, interval: float = 2.0):
+    def __init__(self, name: str, image_path: str, interval: float = 5.0):
+        self.name = name
         self._path = image_path
         self._interval = interval
         self._lock = threading.Lock()
@@ -110,36 +108,29 @@ class ImageTracker:
         self._md5: str | None = None
         self._size: int = 0
         self._exists: bool = False
-        # 实际检测到内容变化的时间
         self._last_changed: str | None = None
 
-        # 初始化一次快照
         self._refresh()
 
-        # 启动后台守护线程
         self._thread = threading.Thread(target=self._watch_loop, daemon=True)
         self._thread.start()
 
     def _refresh(self):
-        """读取文件当前状态，若 MD5 变化则更新 last_changed"""
         if not os.path.isfile(self._path):
             with self._lock:
                 self._exists = False
                 self._md5 = None
                 self._size = 0
             return
-
         try:
             md5 = _file_md5(self._path)
             size = os.path.getsize(self._path)
         except OSError:
             return
-
         with self._lock:
             self._exists = True
             self._size = size
             if md5 != self._md5:
-                # 内容发生了变化（或首次读取）
                 self._md5 = md5
                 self._last_changed = datetime.now(timezone.utc).isoformat()
 
@@ -151,68 +142,109 @@ class ImageTracker:
     def get_info(self) -> dict:
         with self._lock:
             if not self._exists:
-                return {"exists": False}
+                return {"name": self.name, "exists": False}
             return {
+                "name": self.name,
                 "exists": True,
                 "last_modified": self._last_changed,
                 "size": self._size,
                 "md5": self._md5,
             }
 
+    @property
+    def path(self) -> str:
+        return self._path
 
-# 全局追踪器实例
-tracker = ImageTracker(IMAGE_PATH, CHECK_INTERVAL)
+
+# ───────── 创建所有图像的追踪器 ─────────
+# name -> ImageTracker
+trackers: dict[str, ImageTracker] = {}
+for img_cfg in IMAGES_CFG:
+    name = img_cfg.get("name", "")
+    path = img_cfg.get("path", "")
+    if name and path:
+        trackers[name] = ImageTracker(name, path, CHECK_INTERVAL)
+
+
+def _get_tracker(name: str) -> ImageTracker:
+    """根据名称获取追踪器，不存在则 404"""
+    t = trackers.get(name)
+    if t is None:
+        raise HTTPException(status_code=404, detail=f"图像 '{name}' 不存在")
+    return t
+
+
+def _auth(request: Request, x_api_key: str | None, x_client_id: str | None):
+    """统一鉴权"""
+    verify_api_key(
+        x_api_key,
+        client_id=x_client_id or "",
+        client_ip=request.client.host if request.client else "",
+    )
 
 
 # ───────── 路由 ─────────
 
 @app.get("/allsky/")
 def root():
-    return {"message": "图像监控 API 正在运行"}
+    return {"message": "图像监控 API 正在运行", "image_count": len(trackers)}
 
 
-@app.get("/allsky/api/image/status")
+@app.get("/allsky/api/images")
+def list_images(
+    request: Request,
+    x_api_key: str | None = Header(None),
+    x_client_id: str | None = Header(None),
+):
+    """返回所有图像的名称列表"""
+    _auth(request, x_api_key, x_client_id)
+    names = list(trackers.keys())
+    return JSONResponse(content={"images": names})
+
+
+@app.get("/allsky/api/images/status")
+def all_images_status(
+    request: Request,
+    x_api_key: str | None = Header(None),
+    x_client_id: str | None = Header(None),
+):
+    """返回所有图像的状态（批量查询）"""
+    _auth(request, x_api_key, x_client_id)
+    result = [t.get_info() for t in trackers.values()]
+    return JSONResponse(content={"images": result})
+
+
+@app.get("/allsky/api/image/{name}/status")
 def image_status(
+    name: str,
     request: Request,
     x_api_key: str | None = Header(None),
     x_client_id: str | None = Header(None),
 ):
-    """
-    检查图像是否存在、最后更换时间和 MD5
-    last_modified 为服务端检测到图像内容变化的真实时间，非文件系统时间
-    """
-    verify_api_key(
-        x_api_key,
-        client_id=x_client_id or "",
-        client_ip=request.client.host if request.client else "",
-    )
-    info = tracker.get_info()
-    return JSONResponse(content=info)
+    """检查指定图像的状态"""
+    _auth(request, x_api_key, x_client_id)
+    t = _get_tracker(name)
+    return JSONResponse(content=t.get_info())
 
 
-@app.get("/allsky/api/image/data")
+@app.get("/allsky/api/image/{name}/data")
 def image_data(
+    name: str,
     request: Request,
     x_api_key: str | None = Header(None),
     x_client_id: str | None = Header(None),
 ):
-    """
-    返回图像二进制数据
-    """
-    verify_api_key(
-        x_api_key,
-        client_id=x_client_id or "",
-        client_ip=request.client.host if request.client else "",
-    )
+    """返回指定图像的二进制数据"""
+    _auth(request, x_api_key, x_client_id)
+    t = _get_tracker(name)
 
-    if not os.path.isfile(IMAGE_PATH):
+    if not os.path.isfile(t.path):
         raise HTTPException(status_code=404, detail="图像文件不存在")
 
-    with open(IMAGE_PATH, "rb") as f:
+    with open(t.path, "rb") as f:
         data = f.read()
 
-    # 根据扩展名确定 MIME 类型
-    ext = os.path.splitext(IMAGE_PATH)[1].lower()
+    ext = os.path.splitext(t.path)[1].lower()
     mime_map = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
@@ -228,7 +260,9 @@ def image_data(
 
 # ───────── 入口 ─────────
 if __name__ == "__main__":
-    print(f"监控图像路径: {IMAGE_PATH}")
+    print(f"监控图像数量: {len(trackers)}")
+    for n, t in trackers.items():
+        print(f"  [{n}] -> {t.path}")
     print(f"允许的 API Key 数量: {len(API_KEYS)}")
     print(f"启动服务: {HOST}:{PORT}")
     uvicorn.run(app, host=HOST, port=PORT)

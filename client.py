@@ -1,6 +1,6 @@
 """
 图像监控客户端 - PySide6 GUI
-定时轮询服务端，检查图像是否有更新，若有则拉取并展示
+定时轮询服务端，检查所有图像是否有更新，同时展示全部图像
 所有连接配置从 client_config.yaml 读取
 """
 
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QScrollArea,
     QSizePolicy,
+    QFrame,
 )
 
 # ───────── 加载配置 ─────────
@@ -37,24 +38,122 @@ def load_config() -> dict:
     return {}
 
 
+# ───────── 单个图像卡片 Widget ─────────
+class ImageCard(QGroupBox):
+    """一个图像的展示卡片：标题 + 状态 + 图像"""
+
+    def __init__(self, name: str, parent=None):
+        super().__init__(name, parent)
+        self.image_name = name
+        self._last_modified_iso: str | None = None
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        # 状态行
+        info_row = QHBoxLayout()
+        self._lbl_modified = QLabel("最后更新时间: --")
+        self._lbl_md5 = QLabel("MD5: --")
+        self._lbl_size = QLabel("大小: --")
+        info_row.addWidget(self._lbl_modified)
+        info_row.addWidget(self._lbl_md5)
+        info_row.addWidget(self._lbl_size)
+        info_row.addStretch()
+        layout.addLayout(info_row)
+
+        # 图像
+        self._lbl_image = QLabel("暂无图像")
+        self._lbl_image.setAlignment(Qt.AlignCenter)
+        self._lbl_image.setMinimumHeight(200)
+        self._lbl_image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._lbl_image.setStyleSheet("background-color: #2b2b2b; color: #aaa; font-size: 14px;")
+        self._lbl_image.setFrameShape(QFrame.StyledPanel)
+        layout.addWidget(self._lbl_image, stretch=1)
+
+    def update_status(self, info: dict):
+        if not info.get("exists"):
+            self._last_modified_iso = None
+            self._lbl_modified.setText("最后更新时间: 文件不存在")
+            self._lbl_md5.setText("MD5: --")
+            self._lbl_size.setText("大小: --")
+            return
+        self._last_modified_iso = info.get("last_modified", "")
+        self._refresh_elapsed()
+        self._lbl_md5.setText(f"MD5: {info.get('md5', '--')}")
+        size_bytes = info.get("size", 0)
+        if size_bytes >= 1024 * 1024:
+            size_str = f"{size_bytes / 1024 / 1024:.2f} MB"
+        elif size_bytes >= 1024:
+            size_str = f"{size_bytes / 1024:.1f} KB"
+        else:
+            size_str = f"{size_bytes} B"
+        self._lbl_size.setText(f"大小: {size_str}")
+
+    def update_image(self, data: bytes):
+        img = QImage()
+        img.loadFromData(data)
+        if img.isNull():
+            self._lbl_image.setText("图像解码失败")
+            return
+        pixmap = QPixmap.fromImage(img)
+        scaled = pixmap.scaled(
+            self._lbl_image.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self._lbl_image.setPixmap(scaled)
+
+    def refresh_elapsed(self):
+        """外部定时器调用，刷新时间差显示"""
+        self._refresh_elapsed()
+
+    def _refresh_elapsed(self):
+        if self._last_modified_iso:
+            elapsed = _format_elapsed(self._last_modified_iso)
+            self._lbl_modified.setText(
+                f"最后更新时间: {self._last_modified_iso}  （{elapsed}前）"
+            )
+
+
+def _format_elapsed(iso_str: str) -> str:
+    """将 ISO 时间字符串与当前时间比较，返回 'X天X小时X分X秒' 格式"""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        delta = now - dt
+        total_seconds = int(delta.total_seconds())
+        if total_seconds < 0:
+            return "刚刚"
+        days, remainder = divmod(total_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{days}天{hours}小时{minutes}分{seconds}秒"
+    except Exception:
+        return "--"
+
+
 # ───────── 后台轮询线程 ─────────
 class PollerThread(QThread):
-    """后台线程：检查图像状态 & 拉取图像"""
+    """后台线程：批量查询所有图像状态，拉取所有有变化的图像"""
 
-    status_ready = Signal(dict)       # 发送 status 信息
-    image_ready = Signal(bytes)       # 发送图像字节
-    error_occurred = Signal(str)      # 发送错误信息
+    status_ready = Signal(list)       # 发送所有图像 status 列表
+    image_ready = Signal(str, bytes)  # (image_name, 图像字节)
+    error_occurred = Signal(str)
 
-    def __init__(self, server_url: str, api_key: str, client_id: str):
+    def __init__(self, server_url: str, api_key: str, client_id: str,
+                 last_md5_map: dict):
         super().__init__()
         self.server_url = server_url.rstrip("/")
         self.api_key = api_key
         self.client_id = client_id
-        self._last_md5: str | None = None
+        self.last_md5_map = last_md5_map
         self._running = True
 
     def run(self):
-        """单次轮询（由 QTimer 触发，每次启动线程执行一次）"""
         if not self._running:
             return
         try:
@@ -63,9 +162,9 @@ class PollerThread(QThread):
                 "X-Client-Id": self.client_id,
             }
 
-            # 1. 查询状态
+            # 1. 批量查询所有图像状态
             resp = requests.get(
-                f"{self.server_url}/allsky/api/image/status",
+                f"{self.server_url}/allsky/api/images/status",
                 headers=headers,
                 timeout=10,
             )
@@ -77,26 +176,27 @@ class PollerThread(QThread):
                 self.error_occurred.emit(detail)
                 return
             resp.raise_for_status()
-            info: dict = resp.json()
-            self.status_ready.emit(info)
+            images_info: list = resp.json().get("images", [])
+            self.status_ready.emit(images_info)
 
-            if not info.get("exists"):
-                self.error_occurred.emit("服务器上图像文件不存在")
-                return
+            # 2. 逐个检查 MD5，有变化的全部拉取
+            for info in images_info:
+                name = info.get("name", "")
+                if not name or not info.get("exists"):
+                    continue
+                new_md5 = info.get("md5", "")
+                old_md5 = self.last_md5_map.get(name)
+                if new_md5 and new_md5 == old_md5:
+                    continue  # 未变化
 
-            # 2. 比较 MD5，如有变化则拉取图像
-            new_md5 = info.get("md5", "")
-            if new_md5 and new_md5 == self._last_md5:
-                return  # 图像未变化
-
-            resp_img = requests.get(
-                f"{self.server_url}/allsky/api/image/data",
-                headers=headers,
-                timeout=30,
-            )
-            resp_img.raise_for_status()
-            self.image_ready.emit(resp_img.content)
-            self._last_md5 = new_md5
+                resp_img = requests.get(
+                    f"{self.server_url}/allsky/api/image/{name}/data",
+                    headers=headers,
+                    timeout=30,
+                )
+                resp_img.raise_for_status()
+                self.image_ready.emit(name, resp_img.content)
+                self.last_md5_map[name] = new_md5
 
         except requests.ConnectionError:
             self.error_occurred.emit("无法连接到服务器")
@@ -112,16 +212,17 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("图像监控客户端")
-        self.resize(900, 700)
+        self.resize(1000, 800)
 
         cfg = load_config()
         self._server_url = cfg.get("server_url", "http://127.0.0.1:8120")
         self._api_key = cfg.get("api_key", "key-abc123456")
         self._poll_interval = cfg.get("poll_interval", 5)
         self._poller: PollerThread | None = None
-        self._last_modified_iso: str | None = None
-        # 每次启动生成唯一客户端 ID，同一 Key 下只允许一个 client_id 活跃
         self._client_id = str(uuid.uuid4())
+
+        self._last_md5_map: dict[str, str] = {}
+        self._image_cards: dict[str, ImageCard] = {}  # name -> ImageCard
 
         self._build_ui()
 
@@ -129,9 +230,9 @@ class MainWindow(QMainWindow):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._do_poll)
 
-        # 时间差刷新定时器（每秒更新一次距今时间）
+        # 时间差刷新定时器（每秒刷新所有卡片的时间差）
         self._elapsed_timer = QTimer(self)
-        self._elapsed_timer.timeout.connect(self._update_elapsed)
+        self._elapsed_timer.timeout.connect(self._update_all_elapsed)
         self._elapsed_timer.start(1000)
 
         # 启动后自动开始监控
@@ -139,127 +240,77 @@ class MainWindow(QMainWindow):
 
     # ── UI 构建 ──
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(10)
-
-        # --- 状态信息区 ---
-        info_group = QGroupBox("图像状态")
-        info_layout = QHBoxLayout(info_group)
-        self._lbl_modified = QLabel("最后更新时间: --")
-        self._lbl_md5 = QLabel("MD5: --")
-        self._lbl_size = QLabel("大小: --")
-        info_layout.addWidget(self._lbl_modified)
-        info_layout.addWidget(self._lbl_md5)
-        info_layout.addWidget(self._lbl_size)
-        info_layout.addStretch()
-        main_layout.addWidget(info_group)
-
-        # --- 图像展示区 ---
+        # 用 QScrollArea 包裹，图像多时可滚动
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setAlignment(Qt.AlignCenter)
 
-        self._lbl_image = QLabel("暂无图像")
-        self._lbl_image.setAlignment(Qt.AlignCenter)
-        self._lbl_image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self._lbl_image.setStyleSheet("background-color: #2b2b2b; color: #aaa; font-size: 18px;")
-        scroll.setWidget(self._lbl_image)
-        main_layout.addWidget(scroll, stretch=1)
+        self._container = QWidget()
+        self._cards_layout = QVBoxLayout(self._container)
+        self._cards_layout.setContentsMargins(12, 12, 12, 12)
+        self._cards_layout.setSpacing(12)
 
-        # --- 状态栏 ---
+        # 底部弹簧，让卡片靠上排列
+        self._cards_layout.addStretch()
+
+        scroll.setWidget(self._container)
+        self.setCentralWidget(scroll)
+
+        # 状态栏
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("就绪")
+
+    def _ensure_card(self, name: str) -> ImageCard:
+        """确保指定名称的卡片存在，不存在则创建"""
+        if name not in self._image_cards:
+            card = ImageCard(name)
+            self._image_cards[name] = card
+            # 插入到 stretch 之前
+            idx = self._cards_layout.count() - 1  # stretch 的位置
+            self._cards_layout.insertWidget(idx, card, stretch=1)
+        return self._image_cards[name]
 
     # ── 控制 ──
     def _start_polling(self):
         if not self._server_url or not self._api_key:
             self._status_bar.showMessage("配置文件缺少 server_url 或 api_key")
             return
-
         self._timer.start(self._poll_interval * 1000)
         self._status_bar.showMessage(f"监控中 — 每 {self._poll_interval} 秒轮询一次")
-        self._do_poll()  # 立即执行一次
+        self._do_poll()
 
     def _do_poll(self):
-        """启动一次后台轮询"""
         if self._poller and self._poller.isRunning():
-            return  # 上一次还没完成
-
-        self._poller = PollerThread(self._server_url, self._api_key, self._client_id)
+            return
+        self._poller = PollerThread(
+            self._server_url,
+            self._api_key,
+            self._client_id,
+            self._last_md5_map,
+        )
         self._poller.status_ready.connect(self._on_status)
         self._poller.image_ready.connect(self._on_image)
         self._poller.error_occurred.connect(self._on_error)
         self._poller.start()
 
-    # ── 时间差计算 ──
-    @staticmethod
-    def _format_elapsed(iso_str: str) -> str:
-        """将 ISO 时间字符串与当前时间比较，返回 'X天X小时X分X秒' 格式"""
-        try:
-            dt = datetime.fromisoformat(iso_str)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
-            delta = now - dt
-            total_seconds = int(delta.total_seconds())
-            if total_seconds < 0:
-                return "刚刚"
-            days, remainder = divmod(total_seconds, 86400)
-            hours, remainder = divmod(remainder, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            return f"{days}天{hours}小时{minutes}分{seconds}秒"
-        except Exception:
-            return "--"
-
-    def _update_elapsed(self):
-        """每秒刷新一次距今时间"""
-        if self._last_modified_iso:
-            elapsed = self._format_elapsed(self._last_modified_iso)
-            self._lbl_modified.setText(f"最后更新时间: {self._last_modified_iso}  （{elapsed}前）")
+    # ── 时间差刷新 ──
+    def _update_all_elapsed(self):
+        for card in self._image_cards.values():
+            card.refresh_elapsed()
 
     # ── 信号槽 ──
-    def _on_status(self, info: dict):
-        if not info.get("exists"):
-            self._last_modified_iso = None
-            self._lbl_modified.setText("最后更新时间: 文件不存在")
-            self._lbl_md5.setText("MD5: --")
-            self._lbl_size.setText("大小: --")
-            return
-        self._last_modified_iso = info.get("last_modified", "")
-        elapsed = self._format_elapsed(self._last_modified_iso) if self._last_modified_iso else "--"
-        self._lbl_modified.setText(f"最后更新时间: {self._last_modified_iso}  （{elapsed}前）")
-        self._lbl_md5.setText(f"MD5: {info.get('md5', '--')}")
-        size_bytes = info.get("size", 0)
-        if size_bytes >= 1024 * 1024:
-            size_str = f"{size_bytes / 1024 / 1024:.2f} MB"
-        elif size_bytes >= 1024:
-            size_str = f"{size_bytes / 1024:.1f} KB"
-        else:
-            size_str = f"{size_bytes} B"
-        self._lbl_size.setText(f"大小: {size_str}")
+    def _on_status(self, images_info: list):
+        for info in images_info:
+            name = info.get("name", "")
+            if not name:
+                continue
+            card = self._ensure_card(name)
+            card.update_status(info)
 
-    def _on_image(self, data: bytes):
-        img = QImage()
-        img.loadFromData(data)
-        if img.isNull():
-            self._lbl_image.setText("图像解码失败")
-            return
-        pixmap = QPixmap.fromImage(img)
-        # 自适应缩放到标签大小
-        scaled = pixmap.scaled(
-            self._lbl_image.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        self._lbl_image.setPixmap(scaled)
-        self._status_bar.showMessage(
-            f"图像已更新 — {pixmap.width()}x{pixmap.height()} — "
-            f"{len(data)} bytes"
-        )
+    def _on_image(self, name: str, data: bytes):
+        card = self._ensure_card(name)
+        card.update_image(data)
+        self._status_bar.showMessage(f"[{name}] 图像已更新 — {len(data)} bytes")
 
     def _on_error(self, msg: str):
         self._status_bar.showMessage(f"⚠ {msg}")
